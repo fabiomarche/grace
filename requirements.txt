@@ -44,3 +44,5 @@ matplotlib==3.10.1
 # TIPSv2 image backbone (models/backbones/tipsv2.py): google/tipsv2-* is loaded through
 # transformers' remote code (trust_remote_code), whose text tokenizer imports sentencepiece.
 sentencepiece==0.2.0
+spacy
+moviepy

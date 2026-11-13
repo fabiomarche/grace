@@ -25,3 +25,5 @@ grace_data/
 # Local, not part of the release
 paper.pdf
 .vscode/
+
+.env
