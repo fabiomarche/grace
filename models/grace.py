@@ -74,6 +74,16 @@ class Grace(InterpretableCLIP):
         center_before_activations: bool = False,
         threshold: float = 1e-2,
         soft_gating: bool = True,
+        # Eligibility traces parameters
+        with_traces: bool = False,
+        is_traces_at_patch_level: bool = None,
+        alpha_traces: float | None = None,
+        gamma_traces: float | None = None,
+        decay_traces: Literal["linear", "quadratic", "cosine_similarity"] = "linear",
+        size_sliding_window_past_embeddings: float | None = None,
+        # we might want to push the embeddings to the sliding window every x frame (this is due to the fact that consecutive 
+        # frames might be too similar and thus the cosine similarity would be too high! --> we're conserving the traces too much)
+        fill_past_embeddings_every: int | None = None,
         **kwargs,
     ) -> None:
         """GRACE: a concepts bottleneck that decomposes visual embeddings into weighted text concepts.
@@ -154,6 +164,27 @@ class Grace(InterpretableCLIP):
         self.soft_gating = soft_gating
         self.threshold = threshold
 
+        # Eligibility Traces
+        assert decay_traces in ["linear", "quadratic", "cosine_similarity"], f"Invalid decay_traces strategy: {decay_traces}"
+        self.with_traces = with_traces
+        self.is_traces_at_patch_level = is_traces_at_patch_level
+        self.alpha_traces = alpha_traces
+        self.gamma_traces = gamma_traces
+        self.decay_traces = decay_traces
+        self.size_sliding_window_past_embeddings = size_sliding_window_past_embeddings
+        self.fill_past_embeddings_every = fill_past_embeddings_every
+        
+        if self.with_traces:
+            if self.alpha_traces is None:
+                raise ValueError("If `with_traces=True`, `alpha_traces` must be provided.")
+            if self.decay_traces in ["linear", "quadratic"] and self.gamma_traces is None:
+                raise ValueError(f"If `decay_traces='{self.decay_traces}'`, `gamma_traces` must be provided.")
+            if self.decay_traces == "cosine_similarity":
+                if self.size_sliding_window_past_embeddings is None or self.size_sliding_window_past_embeddings <= 0:
+                    raise ValueError("If you use the cosine similarity as decaying method, you must pass a proper window size (> 0)")
+                if self.fill_past_embeddings_every is None or self.fill_past_embeddings_every <= 0:
+                    raise ValueError("If you use the cosine similarity as decaying method, you must pass a proper value for filling the embedding every t frame (> 0)")
+            
         # --- Log the full configuration, for reproducibility ---
         logger.info("Initializing Grace model: features_size=%d, num_concepts=%d, hidden_size=%d", self.features_size, len(self.concepts.weight), self.hidden_size)
         logger.info("Loss weights: concepts=%.4f, rec=%.4f, ent_reg=%.4f", self.loss_weight_concepts, self.loss_weight_rec, self.loss_weight_ent_reg)
@@ -161,6 +192,17 @@ class Grace(InterpretableCLIP):
         logger.info("Reconstruction: proj_type=%s, scoring_act_func=%s, reg_strategy=%s, dirichlet_alpha=%.4f", self.proj_type, self.scoring_act_func, self.reg_strategy, self.dirichlet_alpha)
         logger.info("Gating: soft_gating=%s, threshold=%.4f", self.soft_gating, self.threshold)
         logger.info("Flags: symm_jsd=%s, gram_regularization=%s, center_before_activations=%s", self.symm_jsd, self.gram_regularization, self.center_before_activations)
+        if self.with_traces:
+            logger.info(
+                "Eligibility traces: with_traces=%s, is_traces_at_patch_level=%s, alpha_traces=%s, gamma_traces=%s, decay_traces=%s, size_sliding_window_past_embeddings=%s, fill_past_embeddings_every=%s",
+                self.with_traces,
+                self.is_traces_at_patch_level,
+                self.alpha_traces,
+                self.gamma_traces,
+                self.decay_traces,
+                self.size_sliding_window_past_embeddings,
+                self.fill_past_embeddings_every,
+            )
         if kwargs:
             logger.info("Additional (unrecognized) keyword arguments: %s", kwargs)
 
@@ -169,6 +211,43 @@ class Grace(InterpretableCLIP):
         # Learnable mapping applied to the (frozen) concept embeddings before they are
         # used to reconstruct the visual features.
         self.concepts_proj = self._build_reconstruction_projection(self.proj_type, self.features_size)
+
+        if self.with_traces:
+            self.reset_due_to_a_new_video()
+
+    def reset_due_to_a_new_video(self) -> torch.Tensor:
+        """Reset temporal state when starting a new video clip"""
+        self.counter_frames = 0
+        self.past_embeddings = None
+        self.traces = None
+
+    def _aggregate_granularity(self, x: torch.Tensor) -> torch.Tensor:
+        """Keep patch-level granularity [P (=num_patches), D] or collapse spatial patches to global [1, D]."""
+        return x if self.is_traces_at_patch_level else x.mean(dim=0, keepdim=True)
+
+    def _get_traces(self, weights: torch.Tensor, current_embedding: torch.Tensor | None = None, avg_past_embeddings: torch.Tensor | None = None):
+       # Both embeddings have shape [N, dim_feature_size]
+        # weights and self.traces have shape [P, num_concepts], where P = num_patches if at patch level else P = 1
+        if self.decay_traces == "linear":
+            decay_factor = self.gamma_traces
+        elif self.decay_traces == "quadratic":
+            decay_factor = self.gamma_traces ** 2
+        else:
+            if current_embedding is None or avg_past_embeddings is None:
+                raise ValueError("The decay of the traces is based on cosine similarity, both embeddings passed as parameter must be not None!")
+            # Clamped to [0, 1] to prevent negative decay factors on abrupt scene changes;
+            # unsqueezed to [P, 1] to make the multiplication with self.traces [P, num_concepts] broadcastable
+            decay_factor = torch.clamp(nn.CosineSimilarity(dim=-1,eps=1e-6)(current_embedding, avg_past_embeddings), min=0.0).unsqueeze(-1)
+
+        # we must unsqueeze the decay factor to make the multiplication broadcastable
+        return weights + decay_factor * self.traces
+
+    def _push_to_tensor(self, tensor_to_be_pushed: torch.Tensor, embedding_to_be_pushed: torch.Tensor) -> torch.Tensor:
+        # Both tensors have shape [P, num_frames, dim_feature_size], where P = num_patches if at patch level else P = 1
+        if tensor_to_be_pushed.shape[1] >= self.size_sliding_window_past_embeddings:
+            tensor_to_be_pushed = tensor_to_be_pushed[:, 1:, :]
+
+        return torch.cat((tensor_to_be_pushed, embedding_to_be_pushed), dim=1)
 
     def _build_highlighter(self, act_func: ScoringActFunc) -> nn.Module:
         """Build the highlighter module.
@@ -310,6 +389,67 @@ class Grace(InterpretableCLIP):
 
         # Reconstruct visual features from the highlighted activations
         rec_weights, rec_visual_features = self._reconstruct(highlighted_activations)
+
+        if self.with_traces and self.training == False:
+            
+            if self.traces is None:
+                # To understand this step it's important to have a full view on the pipeline.
+                # Suppose for a moment to use TIPSv2 as the backbone. When it encodes the image it produces 
+                # the following shape for the embedding: [Batch size, grid, grid, dim feature size], where grid corresponds 
+                # to one dimension of the patch, i.e. if TIPS produces 14x14 patches, its encoding will be [B, 14, 14, dim feature size].
+                # Then, since grace is backbone agnostic, its encode_image metehod requires the visual_features to be in shape [L, dim feature size].
+                # Therefore the output of TIPS gets flattened out, becoming [B x grid x grid, dim feature size].
+                # Transforming the embedding into concept weights they become [B x grid x grid, num_concepts].
+                #
+                # Suppose now to use another backbone whose output is a global embedding, thus for every image there is one embedding only.
+                # The output of the encode_image method of the respective backbone will be of shape [B, dim feature size], which already
+                # fits the prototype of this current method.
+                #
+                # It is important to remember though that since we are iterating over single images, the batch size is equal to one!
+                # Therefore we are manipulating both cases directly using the shapes we are getting, remembering the fact that for 
+                # TIPS the first dimension of the tensor corresponds to the number of patches (because B (=1) x grid x grid = num_patches),
+                # whereas for global embedding backbones the first dimension will always be 1 as if ther eis one and huge patche covering the whole
+                # image.
+
+                # In short: B = num_patches if backbone = TIPS else 1.
+                # Depending on `is_traces_at_patch_level`, N = B (patch-level) or N = 1 (global-level).
+                self.traces = torch.zeros_like(self._aggregate_granularity(rec_weights))  # [N, num_concepts]
+                if self.decay_traces == "cosine_similarity":
+                    # [N, 1, dim_feature_size], where the middle dimension corresponds to the number of frames
+                    self.past_embeddings = self._aggregate_granularity(visual_features).unsqueeze(1)
+
+            self.counter_frames += 1
+
+            # w_t^{new} = w_t + alpha * traces_{t-1} 
+            # rec_weights always stays [B, num_concepts] (broadcasting automatically if self.traces is [1, num_concepts])
+            rec_weights = rec_weights + self.alpha_traces * self.traces
+
+            # the eligibility traces might let weights exceed the range [0,1], thus we normalize them
+            # keep_dim=True to make the division broadcastable. Without keepdim the sum would have collapsed the -1 dim, leading to a tensor of shape [B],
+            # with keepdim=True, instead it always performs the sum as usual but it mantains the dimension of the input, hence the shape will be [B,1],
+            # making the division with rec_weights (of shape [B,num_concepts]) broadcastable
+            rec_weights = rec_weights / rec_weights.sum(dim=-1, keepdim=True)
+
+            if self.decay_traces == "cosine_similarity":
+                current_embedding = self._aggregate_granularity(visual_features)  # [N, dim_feature_size]
+                
+                if self.counter_frames > 1 and self.counter_frames % self.fill_past_embeddings_every == 0:
+                    self.past_embeddings = self._push_to_tensor(
+                        tensor_to_be_pushed=self.past_embeddings,
+                        embedding_to_be_pushed=current_embedding.unsqueeze(1),  # [N, 1, dim_feature_size]
+                    )
+
+                avg_past_embeddings = self.past_embeddings.mean(dim=1)  # [N, dim_feature_size]
+                
+            else:
+                current_embedding=None
+                avg_past_embeddings=None
+
+            self.traces = self._get_traces(
+                weights=self._aggregate_granularity(rec_weights),  # [N, num_concepts]
+                current_embedding=current_embedding,
+                avg_past_embeddings=avg_past_embeddings,
+            )
 
         if return_weights:
             return rec_visual_features, rec_weights
