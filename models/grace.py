@@ -80,7 +80,7 @@ class Grace(InterpretableCLIP):
         alpha_traces: float | None = None,
         gamma_traces: float | None = None,
         decay_traces: Literal["linear", "quadratic", "cosine_similarity"] = "linear",
-        size_sliding_window_past_embeddings: float | None = None,
+        size_sliding_window_past_embeddings: int | None = None,
         # we might want to push the embeddings to the sliding window every x frame (this is due to the fact that consecutive 
         # frames might be too similar and thus the cosine similarity would be too high! --> we're conserving the traces too much)
         fill_past_embeddings_every: int | None = None,

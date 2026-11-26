@@ -48,7 +48,7 @@ def checkpoint_dict(model: InterpretableCLIP, model_config: dict, backbone_confi
     }
 
 
-def load_checkpoint(path: str, device: torch.device | str = "cpu") -> InterpretableCLIP:
+def load_checkpoint(path: str, device: torch.device | str = "cpu", **model_kwargs) -> InterpretableCLIP:
     """Load a GRACE checkpoint, in eval mode on `device`.
 
     The architecture comes from the checkpoint's own `model` kwargs, so the path alone is enough.
@@ -63,6 +63,7 @@ def load_checkpoint(path: str, device: torch.device | str = "cpu") -> Interpreta
         checkpoint["model"],
         text_concepts=checkpoint["text_concepts"],
         concepts_embds=state_dict["concepts.weight"],
+        **model_kwargs,
     )
     model.load_state_dict(state_dict)
     return model.to(device).eval()

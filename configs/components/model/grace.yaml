@@ -24,3 +24,12 @@ gram_regularization: True
 center_before_activations: False
 threshold: 0.01
 soft_gating: True
+
+# Eligibility Traces (disabled by default)
+with_traces: False
+is_traces_at_patch_level: False
+alpha_traces: 0.5
+gamma_traces: 0.8
+decay_traces: linear # linear, quadratic, cosine_similarity
+size_sliding_window_past_embeddings: 5
+fill_past_embeddings_every: 2
