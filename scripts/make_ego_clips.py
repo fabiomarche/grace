@@ -5,6 +5,9 @@ from argparse import ArgumentParser
 import sys
 from moviepy import * 
 from tqdm import tqdm
+import cv2
+from PIL import Image
+import shutil
 
 """
 This script consists of taking the already downloaded video, and clipping them
@@ -37,6 +40,19 @@ def get_df_benchmark(root: Path) -> pd.DataFrame:
 
     return df
 
+def extract_images_from_mp4(mp4_path: Path, out_dir: Path) -> int:
+    cap = cv2.VideoCapture(str(mp4_path))
+    idx=0
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        Image.fromarray(frame_rgb).save(out_dir / f"{idx:06d}.jpg", quality=95)
+        idx+=1
+    cap.release()
+    return idx
+
 def main(args):
     df_benchmark = get_df_benchmark(root=args.rootGraceData)
 
@@ -47,7 +63,6 @@ def main(args):
     
     ROOT_CLIPS = args.rootGraceData / "ego4d" / "clips"
 
-
     if not os.path.exists(ROOT_CLIPS):
         os.makedirs(ROOT_CLIPS)
 
@@ -55,33 +70,43 @@ def main(args):
         # .groupby() is the native way to aggregate data
         for name_group, group_df_uid in df_benchmark.groupby(by="video_uid"):
 
-            original_video_path = f"{ROOT_VIDEOS}/{name_group}.mp4"
-            original_video = VideoFileClip(original_video_path)
+            clip_video_folder_path = ROOT_CLIPS / str(name_group)
+            clip_video_folder_path.mkdir(parents=True, exist_ok=True)
 
-            clip_video_folder_path = f"{ROOT_CLIPS}/{name_group}"
-            if not os.path.exists(clip_video_folder_path):
-                os.mkdir(clip_video_folder_path)
+            original_video = None
 
             # .itertuples() is much faster wrt .iterrows()
             for row in group_df_uid.itertuples(index=False):
                 clip_start = f"{row.clip_start:.2f}".replace(".", "_")
                 clip_end = f"{row.clip_end:.2f}".replace(".", "_")
-                clip_name = f"{clip_start}-{clip_end}.mp4"
+                clip_name = f"{clip_start}-{clip_end}"
+                
+                clip_folder_path = clip_video_folder_path / clip_name
+                clip_folder_path.mkdir(parents=True, exist_ok=True)
 
-                clip_path = f"{clip_video_folder_path}/{clip_name}"
+                legacy_mp4_path = clip_video_folder_path / f"{clip_name}.mp4"
+                clip_mp4_path = clip_folder_path / f"{clip_name}.mp4"
 
-                if os.path.exists(clip_path): # we skip this clip because it's already there 
-                    pbar.update(1)
-                    continue
+                # If older .mp4 exist in the parent folder, we move it in the sub folder
+                if legacy_mp4_path.exists() and not clip_mp4_path.exists():
+                    shutil.move(str(legacy_mp4_path), str(clip_mp4_path))
 
-                safe_end = min(row.clip_end, original_video.duration) # df is a bit dirty, so thsi is essential
+                if not clip_mp4_path.exists():
+                    if original_video is None:
+                        original_video_path = ROOT_VIDEOS / f"{name_group}.mp4"
+                        original_video = VideoFileClip(str(original_video_path))
 
-                with original_video.subclipped(row.clip_start, safe_end) as sub:
-                    sub.write_videofile(clip_path, audio=False, logger=None) # the audio is useless
+                    safe_end = min(row.clip_end, original_video.duration) # df is a bit dirty, so thsi is essential
+                    with original_video.subclipped(row.clip_start, safe_end) as sub:
+                        sub.write_videofile(str(clip_mp4_path), audio=False, logger=None) # the audio is useless
+
+                if not any(clip_folder_path.glob("*.jpg")):
+                    extract_images_from_mp4(mp4_path=clip_mp4_path, out_dir=clip_folder_path)
 
                 pbar.update(1)
 
-            original_video.close() # it frees the RAM
+            if original_video is not None:
+                original_video.close() # it frees the RAM
 
     print("All clips have been generated!")
 
